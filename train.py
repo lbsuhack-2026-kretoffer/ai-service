@@ -1,25 +1,30 @@
 #!/usr/bin/env python3
 """
 Скрипт генерации данных и обучения моделей CatBoost
-для системы предиктивного заказа школьного питания (версия 2.0 — многогоризонт).
+для системы предиктивного заказа школьного питания (версия 2.1 — многогоризонт + буфет).
 
 Источник данных: PostgreSQL база бэкенда (таблицы schools, classes, students, attendance, canteen_sales).
 
 Модели:
-1. StandardModel — предсказание общего количества порций на хORIZONT днях вперёд (h=1..5)
-   - Глобальная модель по каждому горизонту (standard_global_model_h{h}.cbm)
-   - Дообученные модели для каждой школы (school_{id}_model_h{h}.cbm через Transfer Learning)
-2. BuffetModel — мультитаргетная модель для шведского стола (MultiRMSE)
+1. StandardModel — предсказание общего количества порций на hORIZONT днях вперёд (h=1..5)
+   - Глобальная модель по каждому горизонту (standard_global_model_v2_h{h}.cbm)
+   - Дообученные модели для каждой школы (school_{id}_model_v2_h{h}.cbm через Transfer Learning)
+2. BuffetModel — мультитаргетная модель для шведского стола на hORIZONT днях вперёд (h=1..5)
+   - Глобальная модель по каждому горизонту (buffet_model_v2_h{h}.cbm)
+   - Дообученные модели для каждой школы
 
-Новые признаки (v2.0):
+Новые признаки (v2.1):
 - main_dish — основное блюда дня (категориальный)
 - is_rainy, is_cold — погодные бинарные признаки
 - temp_celsius, precipitation_mm — погодные числовые признаки
-- dish_popularity — история популярности блюда (0..1)
 - present_avg_3d, present_avg_7d — скользящее среднее посещаемости
 - present_trend — тренд посещаемости (сегодня минус вчера)
+- present_t_minus_2, present_t_minus_3 — посещаемость 2 и 3 дня назад
+- present_same_dow_last_week — посещаемость в этот же день недели на прошлой неделе
+- is_holiday_calendar — праздник/каникулы из календаря
 
 Категориальные признаки передаются в CatBoost напрямую (без One-Hot Encoding).
+Вся конфигурация фичей — в features.py (единый источник правды).
 """
 
 from __future__ import annotations
@@ -34,7 +39,7 @@ import numpy as np
 import pandas as pd
 from catboost import CatBoostRegressor, Pool
 from sklearn.model_selection import train_test_split
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine
 
 warnings.filterwarnings("ignore", category=UserWarning, module="catboost")
 
@@ -45,16 +50,37 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Пути к моделям
+# --- Единый источник фичей ---
+from features import (
+    HORIZONS,
+    CAT_FEATURES,
+    BINARY_FEATURES,
+    NUMERIC_FEATURES_STANDARD,
+    NUMERIC_FEATURES_BUFFET,
+    STANDARD_INPUT_FEATURES,
+    BUFFET_INPUT_FEATURES,
+    TARGET_STANDARD,
+    TARGETS_BUFFET,
+    AGE_GROUPS,
+    COLD_THRESHOLD,
+    MAIN_DISHES,
+    DISH_POPULARITY,
+    BUFFET_RATIOS,
+    get_holiday_calendar,
+)
+
+# Пути к моделям (версия v2)
 MODELS_DIR = Path(__file__).parent / "models"
 MODELS_DIR.mkdir(exist_ok=True)
 
-HORIZONS = [1, 2, 3, 4, 5]
+MODEL_VERSION = "v2"
 
 STANDARD_GLOBAL_MODEL_PATHS = {
-    h: MODELS_DIR / f"standard_global_model_h{h}.cbm" for h in HORIZONS
+    h: MODELS_DIR / f"standard_global_model_{MODEL_VERSION}_h{h}.cbm" for h in HORIZONS
 }
-BUFFET_MODEL_PATH = MODELS_DIR / "buffet_model.cbm"
+BUFFET_MODEL_PATHS = {
+    h: MODELS_DIR / f"buffet_model_{MODEL_VERSION}_h{h}.cbm" for h in HORIZONS
+}
 
 # URL подключения к PostgreSQL бэкенда
 DATABASE_URL = os.getenv(
@@ -62,81 +88,8 @@ DATABASE_URL = os.getenv(
     "postgresql+psycopg2://school:school@db:5432/school_balance",
 )
 
-# Список возрастных групп бэкенда
-AGE_GROUPS = ["junior", "middle", "senior"]
-
-# Категориальные признаки (строго в порядке обучения — должны совпадать с main.py)
-CAT_FEATURES = [
-    "school_id",
-    "age_group",
-    "month",
-    "day_of_month",
-    "day_of_week",
-    "main_dish",
-]
-
-BINARY_FEATURES = [
-    "is_pre_holiday",
-    "is_pre_vacation",
-    "is_rainy",
-    "is_cold",
-]
-
-NUMERIC_FEATURES_STANDARD = [
-    "total_students",
-    "opt_outs",
-    "present_today",
-    "present_yesterday",
-    "present_avg_3d",
-    "present_avg_7d",
-    "present_trend",
-    "temp_celsius",
-    "precipitation_mm",
-]
-
-NUMERIC_FEATURES_BUFFET = NUMERIC_FEATURES_STANDARD + [
-    "sold_hot_yesterday",
-    "sold_salad_yesterday",
-    "sold_bakery_yesterday",
-]
-
-STANDARD_INPUT_FEATURES = CAT_FEATURES + BINARY_FEATURES + NUMERIC_FEATURES_STANDARD
-BUFFET_INPUT_FEATURES = CAT_FEATURES + BINARY_FEATURES + NUMERIC_FEATURES_BUFFET
-
-TARGET_STANDARD = "target_portions_tomorrow"  # базовый таргет (h=1)
-TARGETS_BUFFET = [
-    "target_hot_tomorrow",
-    "target_salad_tomorrow",
-    "target_bakery_tomorrow",
-]
-
-# Популярные школы для дообучения (все из БД)
+# Популярные школы для дообучения
 TOP_SCHOOLS_COUNT = 10
-
-# Порог холодной температуры (°C) для признака is_cold
-COLD_THRESHOLD = 10.0
-
-# Популярные блюда для синтетики
-MAIN_DISHES = [
-    "гречка с котлетой",
-    "макароны по-флотски",
-    "пюре с отбивной",
-    "берёзовая каша",
-    "рыба запечённая",
-    "куриный суп",
-    "борщ",
-    "oven-пицца",
-]
-DISH_POPULARITY = {
-    "гречка с котлетой": 0.85,
-    "макароны по-флотски": 0.78,
-    "пюре с отбивной": 0.82,
-    "берёзовая каша": 0.45,
-    "рыба запечённая": 0.60,
-    "куриный суп": 0.70,
-    "борщ": 0.68,
-    "oven-пицца": 0.90,
-}
 
 
 def set_seed(seed: int = 42) -> None:
@@ -148,14 +101,8 @@ def load_backend_data(database_url: str | None = None) -> pd.DataFrame:
     """
     Загружает данные из БД бэкенда (PostgreSQL) и строит обучающую выборку.
 
-    Для каждого дня с посещаемостью формируем запись:
-    - school_id, age_group, month, day_of_month, day_of_week, main_dish
-    - is_pre_holiday, is_pre_vacation, is_rainy, is_cold
-    - total_students, opt_outs, present_today, present_yesterday
-    - present_avg_3d, present_avg_7d, present_trend
-    - temp_celsius, precipitation_mm
-    - для canteen-школ: sold_hot/salad/bakery_yesterday
-    - таргеты по каждому горизонту h=1..5: present_today через h дней
+    Для каждого дня с посещаемостью формируем запись со всеми признаками из features.py
+    и таргетами по каждому горизонту h=1..5.
     """
     url = database_url or DATABASE_URL
     logger.info(f"Загрузка данных из PostgreSQL: {url}")
@@ -165,7 +112,6 @@ def load_backend_data(database_url: str | None = None) -> pd.DataFrame:
 
         schools_df = pd.read_sql("SELECT * FROM schools", engine)
         logger.info(f"Школ: {len(schools_df)}")
-        print(schools_df[["id", "name", "meal_plan"]].to_string(index=False))
 
         classes_df = pd.read_sql("SELECT * FROM classes", engine)
         logger.info(f"Классов: {len(classes_df)}")
@@ -201,6 +147,9 @@ def load_backend_data(database_url: str | None = None) -> pd.DataFrame:
             present_today = max(0, total_students - opt_outs - absent)
             present_lookup[(class_id, att_date)] = present_today
 
+        # Календарь каникул/праздников
+        holiday_calendar = get_holiday_calendar()
+
         # Для каждого класса и даты посещаемости формируем запись
         records = []
         for _, att in att_df.iterrows():
@@ -228,40 +177,40 @@ def load_backend_data(database_url: str | None = None) -> pd.DataFrame:
 
             present_today = max(0, total_students - opt_outs - absent)
 
-            # Present вчера для этого же класса
-            yesterday = att_date - timedelta(days=1)
-            present_yesterday = present_lookup.get((class_id, yesterday), present_today)
+            # Present вчера, 2 и 3 дня назад
+            present_yesterday = present_lookup.get((class_id, att_date - timedelta(days=1)), present_today)
+            present_t_minus_2 = present_lookup.get((class_id, att_date - timedelta(days=2)), present_today)
+            present_t_minus_3 = present_lookup.get((class_id, att_date - timedelta(days=3)), present_today)
 
             # Скользящее среднее за 3 и 7 дней (включая сегодня)
-            window_3 = []
-            window_7 = []
-            for d_offset in range(3):
-                d = att_date - timedelta(days=d_offset)
-                window_3.append(present_lookup.get((class_id, d), present_today))
-            for d_offset in range(7):
-                d = att_date - timedelta(days=d_offset)
-                window_7.append(present_lookup.get((class_id, d), present_today))
+            window_3 = [present_lookup.get((class_id, att_date - timedelta(days=i)), present_today) for i in range(3)]
+            window_7 = [present_lookup.get((class_id, att_date - timedelta(days=i)), present_today) for i in range(7)]
             present_avg_3d = float(np.mean(window_3))
             present_avg_7d = float(np.mean(window_7))
             present_trend = float(present_today - present_yesterday)
+
+            # Посещаемость в этот же день недели на прошлой неделе
+            present_same_dow_last_week = present_lookup.get(
+                (class_id, att_date - timedelta(days=7)), present_today
+            )
 
             # Календарные признаки
             month = att_date.month
             day_of_month = att_date.day
             day_of_week = att_date.weekday()  # 0=Пн, 6=Вс
             is_pre_holiday = 1 if day_of_week == 4 else 0
-            is_pre_vacation = 0
+            is_pre_vacation = 1 if att_date in holiday_calendar else 0
+            is_holiday_calendar_flag = 1 if att_date in holiday_calendar else 0
 
-            # Погодные признаки (в БД нет — заполняем нулями/нейтральными значениями,
+            # Погодные признаки (в БД нет — нейтральные значения,
             # реальная погода будет подтягиваться бэкендом при инференсе)
             temp_celsius = 15.0
             precipitation_mm = 0.0
             is_rainy = 0
             is_cold = 0 if temp_celsius >= COLD_THRESHOLD else 1
 
-            # Блюдо дня (в БД нет таблицы меню для fixed-школ — будет подтягиваться бэкендом)
+            # Блюдо дня (в БД нет таблицы меню для fixed-школ — None)
             main_dish = None
-            dish_popularity = 0.5
 
             record = {
                 "school_id": school_id,
@@ -272,15 +221,18 @@ def load_backend_data(database_url: str | None = None) -> pd.DataFrame:
                 "day_of_week": day_of_week,
                 "is_pre_holiday": is_pre_holiday,
                 "is_pre_vacation": is_pre_vacation,
+                "is_holiday_calendar": is_holiday_calendar_flag,
                 "main_dish": main_dish,
-                "dish_popularity": dish_popularity,
                 "total_students": total_students,
                 "opt_outs": opt_outs,
                 "present_today": present_today,
                 "present_yesterday": present_yesterday,
+                "present_t_minus_2": present_t_minus_2,
+                "present_t_minus_3": present_t_minus_3,
                 "present_avg_3d": present_avg_3d,
                 "present_avg_7d": present_avg_7d,
                 "present_trend": present_trend,
+                "present_same_dow_last_week": present_same_dow_last_week,
                 "temp_celsius": temp_celsius,
                 "precipitation_mm": precipitation_mm,
                 "is_rainy": is_rainy,
@@ -315,32 +267,30 @@ def load_backend_data(database_url: str | None = None) -> pd.DataFrame:
     df = df.sort_values(["school_id", "class_id", "date"])
     for h in HORIZONS:
         df[f"target_portions_h{h}"] = df.groupby(["school_id", "class_id"])["present_today"].shift(-h)
-        # Для последних дней используем present_today как fallback
         df[f"target_portions_h{h}"] = df[f"target_portions_h{h}"].fillna(df["present_today"])
 
     # Базовый таргет (h=1) для обратной совместимости
     df["target_portions_tomorrow"] = df["target_portions_h1"]
 
-    # Буфетные таргеты (для canteen-школ)
+    # Буфетные таргеты по горизонтам (для canteen-школ)
     buffet_mask = df["meal_plan"] == "canteen"
     if buffet_mask.any():
-        df.loc[buffet_mask, "target_hot_tomorrow"] = (
-            df.loc[buffet_mask, "target_portions_h1"] * 0.42
-        ).astype(int)
-        df.loc[buffet_mask, "target_salad_tomorrow"] = (
-            df.loc[buffet_mask, "target_portions_h1"] * 0.18
-        ).astype(int)
-        df.loc[buffet_mask, "target_bakery_tomorrow"] = (
-            df.loc[buffet_mask, "target_portions_h1"] * 0.22
-        ).astype(int)
+        for h in HORIZONS:
+            target_col = f"target_portions_h{h}"
+            ratio_hot = BUFFET_RATIOS["hot"]
+            ratio_salad = BUFFET_RATIOS["salad"]
+            ratio_bakery = BUFFET_RATIOS["bakery"]
+            df.loc[buffet_mask, f"target_hot_h{h}"] = (df.loc[buffet_mask, target_col] * ratio_hot).astype(int)
+            df.loc[buffet_mask, f"target_salad_h{h}"] = (df.loc[buffet_mask, target_col] * ratio_salad).astype(int)
+            df.loc[buffet_mask, f"target_bakery_h{h}"] = (df.loc[buffet_mask, target_col] * ratio_bakery).astype(int)
 
     logger.info(f"Построено записей для обучения: {len(df)}")
     return df
 
 
 def _generate_synthetic_fallback() -> pd.DataFrame:
-    """Генерация синтетических данных с новыми признаками (погода, блюдо, история)."""
-    logger.info("Генерация синтетических данных (fallback, v2.0)...")
+    """Генерация синтетических данных с новыми признаками (погода, календарь, лаги)."""
+    logger.info("Генерация синтетических данных (fallback, v2.1)...")
     np.random.seed(42)
 
     schools = [
@@ -370,8 +320,7 @@ def _generate_synthetic_fallback() -> pd.DataFrame:
             all_dates.append(d)
         d += timedelta(days=1)
 
-    pre_holiday_dates = {date(2026, 10, 30), date(2026, 12, 18)}
-    vacation_dates = {date(2026, 10, 31), date(2026, 11, 1), date(2026, 12, 19), date(2026, 12, 20)}
+    holiday_calendar = get_holiday_calendar()
 
     month_factor = {9: 1.05, 10: 1.02, 11: 1.00, 12: 0.92}
     dow_factor = {0: 1.02, 1: 1.00, 2: 0.98, 3: 0.95, 4: 0.85}
@@ -381,7 +330,7 @@ def _generate_synthetic_fallback() -> pd.DataFrame:
     age_salad = {"junior": 0.10, "middle": 0.20, "senior": 0.30}
     age_bakery = {"junior": 0.35, "middle": 0.25, "senior": 0.20}
 
-    # Погода по месяцам (средняя температура, вероятность дождя)
+    # Погода по месяцам
     month_weather = {
         9: {"temp": 14.0, "rain_prob": 0.30},
         10: {"temp": 9.0, "rain_prob": 0.40},
@@ -399,14 +348,14 @@ def _generate_synthetic_fallback() -> pd.DataFrame:
             opt_out_ratio = np.random.uniform(0.05, 0.15)
             opt_outs_base = max(1, int(class_size * opt_out_ratio))
 
-            # Генерируем последовательность посещаемости с автокорреляцией
-            present_history = []
+            present_history: list[int] = []
             for att_date in all_dates:
                 dow = att_date.weekday()
                 month = att_date.month
 
-                is_pre_holiday = 1 if (att_date in pre_holiday_dates or dow == 4) else 0
-                is_pre_vacation = 1 if att_date in pre_holiday_dates else 0
+                is_pre_holiday = 1 if (att_date in holiday_calendar or dow == 4) else 0
+                is_pre_vacation = 1 if att_date in holiday_calendar else 0
+                is_holiday_calendar_flag = 1 if att_date in holiday_calendar else 0
 
                 total_students = max(10, class_size + np.random.randint(-2, 3))
                 opt_outs = max(0, min(opt_outs_base + np.random.randint(-1, 2), total_students))
@@ -423,6 +372,7 @@ def _generate_synthetic_fallback() -> pd.DataFrame:
 
                 # Базовое количество присутствующих (с погодным влиянием)
                 weather_factor = 1.0 - 0.05 * is_rainy - 0.03 * is_cold
+                holiday_factor = 0.70 if is_holiday_calendar_flag else 1.0
 
                 base_present = (
                     (total_students - opt_outs)
@@ -431,6 +381,7 @@ def _generate_synthetic_fallback() -> pd.DataFrame:
                     * dow_factor.get(dow, 1.0)
                     * age_factor_target[age_group]
                     * weather_factor
+                    * holiday_factor
                 )
                 present_today = int(np.random.normal(base_present, base_present * 0.05))
                 present_today = max(0, min(present_today, total_students - opt_outs))
@@ -446,11 +397,14 @@ def _generate_synthetic_fallback() -> pd.DataFrame:
                     "day_of_week": dow,
                     "is_pre_holiday": is_pre_holiday,
                     "is_pre_vacation": is_pre_vacation,
+                    "is_holiday_calendar": is_holiday_calendar_flag,
                     "main_dish": main_dish,
                     "total_students": total_students,
                     "opt_outs": opt_outs,
                     "present_today": present_today,
                     "present_yesterday": present_history[-2] if len(present_history) >= 2 else present_today,
+                    "present_t_minus_2": present_history[-3] if len(present_history) >= 3 else present_today,
+                    "present_t_minus_3": present_history[-4] if len(present_history) >= 4 else present_today,
                     "meal_plan": meal_plan,
                     "date": att_date,
                     "temp_celsius": temp_celsius,
@@ -473,10 +427,18 @@ def _generate_synthetic_fallback() -> pd.DataFrame:
         )
     df["present_trend"] = df.groupby(["school_id", "class_id"])["present_today"].diff(1).fillna(0.0)
 
-    # present_yesterday заполняем через shift (уже частично заполнено выше, но пересчитаем корректно)
+    # present_same_dow_last_week
+    df["present_same_dow_last_week"] = df.groupby(["school_id", "class_id"])["present_today"].shift(7)
+
+    # present_yesterday, present_t_minus_2, present_t_minus_3 через shift
     df["present_yesterday"] = df.groupby(["school_id", "class_id"])["present_today"].shift(1)
-    first_mask = df["present_yesterday"].isna()
-    df.loc[first_mask, "present_yesterday"] = df.loc[first_mask, "present_today"]
+    df["present_t_minus_2"] = df.groupby(["school_id", "class_id"])["present_today"].shift(2)
+    df["present_t_minus_3"] = df.groupby(["school_id", "class_id"])["present_today"].shift(3)
+
+    # Заполняем NaN для первых дней
+    for col in ("present_yesterday", "present_t_minus_2", "present_t_minus_3", "present_same_dow_last_week"):
+        first_mask = df[col].isna()
+        df.loc[first_mask, col] = df.loc[first_mask, "present_today"]
 
     # Таргеты по горизонтам
     for h in HORIZONS:
@@ -487,6 +449,16 @@ def _generate_synthetic_fallback() -> pd.DataFrame:
     # Буфетные фичи и таргеты для canteen-школ
     buffet_mask = df["meal_plan"] == "canteen"
     if buffet_mask.any():
+        for h in HORIZONS:
+            target_col = f"target_portions_h{h}"
+            ratio_hot = BUFFET_RATIOS["hot"]
+            ratio_salad = BUFFET_RATIOS["salad"]
+            ratio_bakery = BUFFET_RATIOS["bakery"]
+            df.loc[buffet_mask, f"target_hot_h{h}"] = (df.loc[buffet_mask, target_col] * ratio_hot).astype(int)
+            df.loc[buffet_mask, f"target_salad_h{h}"] = (df.loc[buffet_mask, target_col] * ratio_salad).astype(int)
+            df.loc[buffet_mask, f"target_bakery_h{h}"] = (df.loc[buffet_mask, target_col] * ratio_bakery).astype(int)
+
+        # Продажи вчера для canteen
         df.loc[buffet_mask, "sold_hot_yesterday"] = (
             df.loc[buffet_mask, "present_yesterday"]
             * df.loc[buffet_mask, "age_group"].map(age_hot)
@@ -504,19 +476,6 @@ def _generate_synthetic_fallback() -> pd.DataFrame:
             * df.loc[buffet_mask, "age_group"].map(age_bakery)
             * np.random.uniform(0.85, 1.15, size=int(buffet_mask.sum()))
         ).clip(lower=0).astype(int)
-
-        df.loc[buffet_mask, "target_hot_tomorrow"] = (
-            df.loc[buffet_mask, "target_portions_h1"]
-            * df.loc[buffet_mask, "age_group"].map(age_hot)
-        ).astype(int)
-        df.loc[buffet_mask, "target_salad_tomorrow"] = (
-            df.loc[buffet_mask, "target_portions_h1"]
-            * df.loc[buffet_mask, "age_group"].map(age_salad)
-        ).astype(int)
-        df.loc[buffet_mask, "target_bakery_tomorrow"] = (
-            df.loc[buffet_mask, "target_portions_h1"]
-            * df.loc[buffet_mask, "age_group"].map(age_bakery)
-        ).astype(int)
 
     logger.info(f"Построено синтетических записей: {len(df)}")
     return df
@@ -537,10 +496,12 @@ def _make_pool(
 
 
 def _fit_global_model(
-    X_train, y_train, X_test, y_test, horizon: int
+    X_train, y_train, X_test, y_test, horizon: int, model_type: str = "standard"
 ) -> CatBoostRegressor:
     """Обучает глобальную модель CatBoostRegressor для заданного горизонта."""
-    logger.info(f"Обучение глобальной модели (h={horizon}, RMSE)...")
+    loss = "RMSE" if model_type == "standard" else "MultiRMSE"
+    eval_metric = "RMSE" if model_type == "standard" else "MultiRMSE"
+    logger.info(f"Обучение глобальной {model_type} модели (h={horizon}, {loss})...")
 
     train_pool = _make_pool(X_train, CAT_FEATURES, label=y_train)
     test_pool = _make_pool(X_test, CAT_FEATURES, label=y_test)
@@ -549,8 +510,8 @@ def _fit_global_model(
         iterations=600,
         learning_rate=0.05,
         depth=6,
-        loss_function="RMSE",
-        eval_metric="RMSE",
+        loss_function=loss,
+        eval_metric=eval_metric,
         random_seed=42,
         verbose=100,
         early_stopping_rounds=50,
@@ -559,21 +520,26 @@ def _fit_global_model(
     model.fit(train_pool, eval_set=test_pool, use_best_model=True)
 
     logger.info(
-        f"Глобальная модель h={horizon}: best_iteration={model.best_iteration_}, "
-        f"best_score={model.best_score_['validation']['RMSE']:.4f}"
+        f"Глобальная {model_type} модель h={horizon}: best_iteration={model.best_iteration_}, "
+        f"best_score={model.best_score_['validation'][eval_metric]:.4f}"
     )
     return model
 
 
 def _fit_school_model(
-    school_id: str, X_school: pd.DataFrame, y_school: pd.Series,
-    global_model: CatBoostRegressor, horizon: int,
+    school_id: str,
+    X_school: pd.DataFrame,
+    y_school: pd.Series | pd.DataFrame,
+    global_model: CatBoostRegressor,
+    horizon: int,
+    model_type: str = "standard",
 ) -> CatBoostRegressor | None:
     """Дообучение модели для конкретной школы через Transfer Learning."""
     if len(X_school) < 10:
         logger.warning(f"Для {school_id} h={horizon} мало данных ({len(X_school)}), пропускаем")
         return None
 
+    loss = "RMSE" if model_type == "standard" else "MultiRMSE"
     X_s_train, X_s_test, y_s_train, y_s_test = train_test_split(
         X_school, y_school, test_size=0.2, random_state=42
     )
@@ -585,8 +551,8 @@ def _fit_school_model(
         iterations=300,
         learning_rate=0.03,
         depth=6,
-        loss_function="RMSE",
-        eval_metric="RMSE",
+        loss_function=loss,
+        eval_metric=loss,
         random_seed=42,
         verbose=50,
         early_stopping_rounds=30,
@@ -600,8 +566,8 @@ def _fit_school_model(
     )
 
     logger.info(
-        f"{school_id} h={horizon}: best_iteration={fine_tuned.best_iteration_}, "
-        f"best_score={fine_tuned.best_score_['validation']['RMSE']:.4f}"
+        f"{school_id} {model_type} h={horizon}: best_iteration={fine_tuned.best_iteration_}, "
+        f"best_score={fine_tuned.best_score_['validation'][loss]:.4f}"
     )
     return fine_tuned
 
@@ -630,7 +596,7 @@ def train_standard_models(df: pd.DataFrame) -> tuple:
         )
 
         # 1. Глобальная модель для этого горизонта
-        global_model = _fit_global_model(X_train, y_train, X_test, y_test, h)
+        global_model = _fit_global_model(X_train, y_train, X_test, y_test, h, model_type="standard")
         global_models[h] = global_model
 
         # Сохранение глобальной модели
@@ -645,13 +611,13 @@ def train_standard_models(df: pd.DataFrame) -> tuple:
         school_models_h: dict[int, CatBoostRegressor] = {}
         for school_id in top_school_ids:
             mask = X["school_id"] == school_id
-            model = _fit_school_model(school_id, X[mask], y[mask], global_model, h)
+            model = _fit_school_model(school_id, X[mask], y[mask], global_model, h, model_type="standard")
             if model is not None:
                 school_models_h[school_id] = model
 
         # Сохранение школьных моделей
         for school_id, model in school_models_h.items():
-            model_path = MODELS_DIR / f"{school_id}_model_h{h}.cbm"
+            model_path = MODELS_DIR / f"{school_id}_model_{MODEL_VERSION}_h{h}.cbm"
             model.save_model(str(model_path))
             logger.info(f"Модель для {school_id} h={h}: {model_path}")
 
@@ -662,43 +628,55 @@ def train_standard_models(df: pd.DataFrame) -> tuple:
     return global_models, school_models_all
 
 
-def train_buffet_model(df: pd.DataFrame) -> CatBoostRegressor:
-    """Обучение мультитаргетной модели для шведского стола."""
+def train_buffet_models(df: pd.DataFrame) -> dict[int, CatBoostRegressor]:
+    """
+    Обучение буфетных моделей по всем горизонтам h=1..5.
+    Возвращает dict horizon->model.
+    """
     logger.info("=" * 60)
-    logger.info("ОБУЧЕНИЕ МОДЕЛИ 'ШВЕДСКИЙ СТОЛ' (Multi-target)")
+    logger.info("ОБУЧЕНИЕ МОДЕЛИ 'ШВЕДСКИЙ СТОЛ' (многогоризонт, h=1..5)")
     logger.info("=" * 60)
 
+    buffet_models: dict[int, CatBoostRegressor] = {}
     buffet_df = df[df["meal_plan"] == "canteen"].copy()
     if buffet_df.empty:
-        logger.warning("Нет canteen-данных — буфетная модель не обучена")
-        return None
+        logger.warning("Нет canteen-данных — буфетные модели не обучены")
+        return buffet_models
 
-    X = buffet_df[BUFFET_INPUT_FEATURES]
-    y = buffet_df[TARGETS_BUFFET]
+    for h in HORIZONS:
+        target_cols = [f"target_hot_h{h}", f"target_salad_h{h}", f"target_bakery_h{h}"]
+        logger.info(f"\n--- Горизонт h={h} (таргеты: {target_cols}) ---")
 
-    train_pool = _make_pool(X, CAT_FEATURES, label=y.to_numpy())
+        X = buffet_df[BUFFET_INPUT_FEATURES]
+        y = buffet_df[target_cols]
 
-    model = CatBoostRegressor(
-        iterations=600,
-        learning_rate=0.05,
-        depth=6,
-        loss_function="MultiRMSE",
-        eval_metric="MultiRMSE",
-        random_seed=42,
-        verbose=100,
-        early_stopping_rounds=50,
-        allow_writing_files=False,
-    )
-    model.fit(train_pool, use_best_model=True)
+        train_pool = _make_pool(X, CAT_FEATURES, label=y.to_numpy())
 
-    logger.info(f"Буфетная модель: best_iteration={model.best_iteration_}")
-    model.save_model(str(BUFFET_MODEL_PATH))
-    logger.info(f"Буфетная модель: {BUFFET_MODEL_PATH}")
-    return model
+        model = CatBoostRegressor(
+            iterations=600,
+            learning_rate=0.05,
+            depth=6,
+            loss_function="MultiRMSE",
+            eval_metric="MultiRMSE",
+            random_seed=42,
+            verbose=100,
+            early_stopping_rounds=50,
+            allow_writing_files=False,
+        )
+        model.fit(train_pool, use_best_model=True)
+
+        logger.info(
+            f"Буфетная модель h={h}: best_iteration={model.best_iteration_}"
+        )
+        model.save_model(str(BUFFET_MODEL_PATHS[h]))
+        logger.info(f"Буфетная модель h={h}: {BUFFET_MODEL_PATHS[h]}")
+        buffet_models[h] = model
+
+    return buffet_models
 
 
 def main() -> None:
-    logger.info("Запуск пайплайна обучения моделей 'Школьный Баланс-Пит' v2.0")
+    logger.info("Запуск пайплайна обучения моделей 'Школьный Баланс-Пит' v2.1")
     set_seed(42)
 
     df = load_backend_data()
@@ -706,11 +684,12 @@ def main() -> None:
     # 1. Стандартное питание (многогоризонт)
     global_models, school_models_all = train_standard_models(df)
 
-    # 2. Шведский стол
-    buffet_model = train_buffet_model(df)
+    # 2. Шведский стол (многогоризонт)
+    buffet_models = train_buffet_models(df)
 
     logger.info("=" * 60)
     logger.info("ОБУЧЕНИЕ ЗАВЕРШЕНО УСПЕШНО")
+    logger.info(f"Версия модели: {MODEL_VERSION}")
     logger.info(f"Горизонты: {HORIZONS}")
     logger.info(f"Модели: {MODELS_DIR}")
     logger.info("=" * 60)

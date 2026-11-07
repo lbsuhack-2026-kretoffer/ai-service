@@ -12,14 +12,18 @@ STANDARD_PAYLOAD = {
     "day_of_week": 2,
     "is_pre_holiday": 0,
     "is_pre_vacation": 0,
+    "is_holiday_calendar": 0,
     "main_dish": None,
     "total_students": 300,
     "opt_outs": 24,
     "present_today": 276,
     "present_yesterday": 270,
+    "present_t_minus_2": 268,
+    "present_t_minus_3": 265,
     "present_avg_3d": 272.0,
     "present_avg_7d": 268.0,
     "present_trend": 6.0,
+    "present_same_dow_last_week": 274,
     "temp_celsius": 12.0,
     "precipitation_mm": 0.0,
     "is_rainy": 0,
@@ -33,9 +37,12 @@ MULTI_DAY_PAYLOAD = {
     "opt_outs": 24,
     "present_today": 276,
     "present_yesterday": 270,
+    "present_t_minus_2": 268,
+    "present_t_minus_3": 265,
     "present_avg_3d": 272.0,
     "present_avg_7d": 268.0,
     "present_trend": 6.0,
+    "present_same_dow_last_week": 274,
     "days": [
         {
             "date": "2026-10-16",
@@ -44,7 +51,18 @@ MULTI_DAY_PAYLOAD = {
             "day_of_week": 3,
             "is_pre_holiday": 0,
             "is_pre_vacation": 0,
+            "is_holiday_calendar": 0,
             "main_dish": None,
+            "total_students": 300,
+            "opt_outs": 24,
+            "present_today": 276,
+            "present_yesterday": 270,
+            "present_t_minus_2": 268,
+            "present_t_minus_3": 265,
+            "present_avg_3d": 272.0,
+            "present_avg_7d": 268.0,
+            "present_trend": 6.0,
+            "present_same_dow_last_week": 274,
             "temp_celsius": 11.0,
             "precipitation_mm": 0.0,
             "is_rainy": 0,
@@ -57,7 +75,18 @@ MULTI_DAY_PAYLOAD = {
             "day_of_week": 4,
             "is_pre_holiday": 1,
             "is_pre_vacation": 0,
+            "is_holiday_calendar": 0,
             "main_dish": None,
+            "total_students": 300,
+            "opt_outs": 24,
+            "present_today": 276,
+            "present_yesterday": 270,
+            "present_t_minus_2": 268,
+            "present_t_minus_3": 265,
+            "present_avg_3d": 272.0,
+            "present_avg_7d": 268.0,
+            "present_trend": 6.0,
+            "present_same_dow_last_week": 274,
             "temp_celsius": 10.0,
             "precipitation_mm": 2.0,
             "is_rainy": 1,
@@ -70,7 +99,18 @@ MULTI_DAY_PAYLOAD = {
             "day_of_week": 0,
             "is_pre_holiday": 0,
             "is_pre_vacation": 0,
+            "is_holiday_calendar": 0,
             "main_dish": None,
+            "total_students": 300,
+            "opt_outs": 24,
+            "present_today": 276,
+            "present_yesterday": 270,
+            "present_t_minus_2": 268,
+            "present_t_minus_3": 265,
+            "present_avg_3d": 272.0,
+            "present_avg_7d": 268.0,
+            "present_trend": 6.0,
+            "present_same_dow_last_week": 274,
             "temp_celsius": 13.0,
             "precipitation_mm": 0.0,
             "is_rainy": 0,
@@ -87,14 +127,18 @@ BUFFET_PAYLOAD = {
     "day_of_week": 2,
     "is_pre_holiday": 0,
     "is_pre_vacation": 0,
+    "is_holiday_calendar": 0,
     "main_dish": None,
     "total_students": 200,
     "opt_outs": 16,
     "present_today": 184,
     "present_yesterday": 180,
+    "present_t_minus_2": 176,
+    "present_t_minus_3": 172,
     "present_avg_3d": 182.0,
     "present_avg_7d": 178.0,
     "present_trend": 4.0,
+    "present_same_dow_last_week": 182,
     "temp_celsius": 12.0,
     "precipitation_mm": 0.0,
     "is_rainy": 0,
@@ -205,7 +249,6 @@ ML_PAYLOAD_FIXED = {
     "total_classes": 3,
     "based_on_date": "2026-10-15",
     "confidence": 0.8,
-    # Новые поля v2.0
     "forecast_days": 5,
     "main_dish": None,
     "weather": {
@@ -215,6 +258,11 @@ ML_PAYLOAD_FIXED = {
     "present_avg_3d": 272.0,
     "present_avg_7d": 268.0,
     "present_trend": 6.0,
+    "present_yesterday": 270,
+    "present_t_minus_2": 268,
+    "present_t_minus_3": 265,
+    "present_same_dow_last_week": 274,
+    "is_holiday_calendar": 0,
 }
 
 ML_PAYLOAD_CANTEEN = {
@@ -235,7 +283,6 @@ ML_PAYLOAD_CANTEEN = {
     "yesterday_total_qty": 88,
     "based_on_date": "2026-10-15",
     "confidence": 0.8,
-    # Новые поля v2.0
     "forecast_days": 5,
     "main_dish": None,
     "weather": {
@@ -244,6 +291,11 @@ ML_PAYLOAD_CANTEEN = {
     "present_avg_3d": 182.0,
     "present_avg_7d": 178.0,
     "present_trend": 4.0,
+    "present_yesterday": 180,
+    "present_t_minus_2": 176,
+    "present_t_minus_3": 172,
+    "present_same_dow_last_week": 182,
+    "is_holiday_calendar": 0,
 }
 
 
@@ -258,6 +310,7 @@ def test_ml_predict_fixed(client: TestClient):
     assert isinstance(body["confidence"], float)
     assert "forecast_days" in body
     assert isinstance(body["forecast_days"], list)
+    assert "model_used" in body
 
 
 def test_ml_predict_canteen(client: TestClient):
@@ -269,6 +322,7 @@ def test_ml_predict_canteen(client: TestClient):
     assert "confidence" in body
     assert isinstance(body["total_portions"], int)
     assert isinstance(body["confidence"], float)
+    assert "model_used" in body
 
 
 def test_ml_predict_missing_required_field_422(client: TestClient):

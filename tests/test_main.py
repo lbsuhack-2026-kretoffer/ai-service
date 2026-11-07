@@ -13,6 +13,7 @@ def test_health(client: TestClient):
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "ok"
-    assert "horizons" in body
+    assert "standard_horizons" in body
+    assert "buffet_horizons" in body
     assert "schools" in body
-    assert "buffet" in body
+    assert "model_version" in body
