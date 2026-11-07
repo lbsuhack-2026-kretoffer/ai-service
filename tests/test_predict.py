@@ -210,12 +210,13 @@ def test_predict_multi_too_many_days_422(client: TestClient):
 
 
 def test_predict_buffet_valid(client: TestClient):
-    """Валидный вход /predict/buffet — 200 с {hot, salad, bakery}."""
+    """Валидный вход /predict/buffet — 200 с categories {hot, salad, bakery}."""
     response = client.post("/predict/buffet", json=BUFFET_PAYLOAD)
     assert response.status_code == 200, response.text
     body = response.json()
-    assert set(body.keys()) == {"hot", "salad", "bakery"}
-    assert all(isinstance(v, float) for v in body.values())
+    assert "categories" in body
+    assert set(body["categories"].keys()) == {"hot", "salad", "bakery"}
+    assert all(isinstance(v, float) for v in body["categories"].values())
 
 
 def test_predict_buffet_invalid_age_group_422(client: TestClient):

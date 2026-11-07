@@ -44,7 +44,8 @@ from features import (
     TARGETS_BUFFET,
     AGE_GROUPS,
     COLD_THRESHOLD,
-    BUFFET_RATIOS,
+    BUFFET_CATEGORIES,
+    buffet_ratio_for,
     get_holiday_calendar,
 )
 
@@ -252,25 +253,17 @@ def _buffet_prediction(
     if prediction.ndim == 1:
         prediction = prediction.reshape(1, -1)
 
-    # Если модель вернула 1 цель вместо 3 — применяем стандартные доли буфета
-    if prediction.shape[1] == 1:
-        single = float(prediction[0][0])
-        return {
-            "hot": single * BUFFET_RATIOS["hot"],
-            "salad": single * BUFFET_RATIOS["salad"],
-            "bakery": single * BUFFET_RATIOS["bakery"],
-        }
-
-    if prediction.ndim != 2 or prediction.shape[1] != 3:
+    n_categories = len(BUFFET_CATEGORIES)
+    if prediction.shape[1] != n_categories:
         logger.error(
-            f"Буфетная модель h={horizon}: ожидалось 3 предсказания, получено {prediction.shape}"
+            f"Буфетная модель h={horizon}: ожидалось {n_categories} предсказаний "
+            f"(категории {BUFFET_CATEGORIES}), получено {prediction.shape[1]}"
         )
         return None
 
     return {
-        "hot": float(prediction[0][0]),
-        "salad": float(prediction[0][1]),
-        "bakery": float(prediction[0][2]),
+        cat: float(prediction[0][i])
+        for i, cat in enumerate(BUFFET_CATEGORIES)
     }
 
 
@@ -532,9 +525,7 @@ class BuffetPredictionRequest(BaseModel):
 
 
 class BuffetPredictionResponse(BaseModel):
-    hot: float
-    salad: float
-    bakery: float
+    categories: Dict[str, float]
 
 
 # ---------------------------------------------------------------------------
@@ -547,6 +538,7 @@ class MLPredictRequest(BaseModel):
     """
     school_id: str
     school_name: str | None = None
+    age_group: str = Field("middle", description="Возрастная группа: junior, middle, senior")
     date: str | date | None = None
     meal_plan: str = "fixed"
     buffer_percent: int = 8
@@ -578,6 +570,12 @@ class MLPredictRequest(BaseModel):
     present_same_dow_last_week: int | None = Field(None, description="Посещаемость в этот же день недели на прошлой неделе")
     is_holiday_calendar: int | None = Field(None, description="Праздник/каникулы из календаря")
 
+    @validator("age_group")
+    def validate_age_group(cls, v):
+        if v not in AGE_GROUPS:
+            raise ValueError("age_group должен быть 'junior', 'middle' или 'senior'")
+        return v
+
 
 class MLPredictResponse(BaseModel):
     """Ответ AI-сервиса — скорректированный прогноз."""
@@ -585,6 +583,7 @@ class MLPredictResponse(BaseModel):
     confidence: float | None = None
     forecast_days: list[dict] | None = None  # [{date, predicted_portions, confidence, horizon}, ...]
     model_used: str | None = None  # "ml" или "fallback"
+    categories: dict[str, float] | None = None  # прогноз по категориям буфета (для canteen)
 
 
 # ---------------------------------------------------------------------------
@@ -717,16 +716,13 @@ async def predict_buffet(request: BuffetPredictionRequest) -> BuffetPredictionRe
     }
     result = _buffet_prediction(input_data, horizon=1)
     if result is None:
-        # Fallback: базовые доли от посещаемости
-        base = _base_formula_portions(request.present_today, 0)
+        # Fallback: базовый прогноз без буфера (буфер добавляет фронтенд при заявке)
+        base = float(request.present_today)
         result = {
-            "hot": base * 0.42,
-            "salad": base * 0.18,
-            "bakery": base * 0.22,
+            cat: base * buffet_ratio_for(cat, request.age_group)
+            for cat in BUFFET_CATEGORIES
         }
-    return BuffetPredictionResponse(
-        hot=result["hot"], salad=result["salad"], bakery=result["bakery"]
-    )
+    return BuffetPredictionResponse(categories=result)
 
 
 # ---------------------------------------------------------------------------
@@ -757,13 +753,14 @@ async def ml_predict(request: MLPredictRequest) -> MLPredictResponse:
     month = target_date.month
     day_of_month = target_date.day
     day_of_week = target_date.weekday()  # 0=Пн, 6=Вс
-    is_pre_holiday = 1 if day_of_week == 4 else 0
-    is_pre_vacation = 0
     holiday_calendar = get_holiday_calendar()
+    is_pre_holiday = 1 if day_of_week == 4 else 0
+    is_pre_vacation = 1 if (target_date + timedelta(days=1)).isoformat() in holiday_calendar else 0
     is_holiday_calendar_flag = 1 if target_date.isoformat() in holiday_calendar else 0
 
     school_id = payload.get("school_id", "")
     meal_plan = payload.get("meal_plan", "fixed")
+    age_group = payload.get("age_group", "middle")
     total_students = payload.get("total_students", 0)
     opt_outs = payload.get("opt_outs", 0)
     present_today = payload.get("present", 0)
@@ -800,11 +797,13 @@ async def ml_predict(request: MLPredictRequest) -> MLPredictResponse:
     total_portions: int | None = None
     confidence: float = 0.50
 
+    buffet_categories: dict[str, float] | None = None
+
     if meal_plan == "canteen":
         # Буфетная модель
         buffet_result = _buffet_prediction({
             "school_id": school_id,
-            "age_group": "middle",
+            "age_group": age_group,
             "month": month,
             "day_of_month": day_of_month,
             "day_of_week": day_of_week,
@@ -826,25 +825,29 @@ async def ml_predict(request: MLPredictRequest) -> MLPredictResponse:
             "precipitation_mm": w_today["precipitation_mm"],
             "is_rainy": w_today["is_rainy"],
             "is_cold": w_today["is_cold"],
-            "sold_hot_yesterday": payload.get("yesterday_total_qty", 0) * 0.42,
-            "sold_salad_yesterday": payload.get("yesterday_total_qty", 0) * 0.18,
-            "sold_bakery_yesterday": payload.get("yesterday_total_qty", 0) * 0.22,
+            **{
+                f"sold_{cat}_yesterday": payload.get("yesterday_total_qty", 0)
+                * buffet_ratio_for(cat, age_group)
+                for cat in BUFFET_CATEGORIES
+            },
         }, horizon=1)
 
         if buffet_result is not None:
-            total_portions = int(round(buffet_result["hot"] + buffet_result["salad"] + buffet_result["bakery"]))
+            buffet_categories = buffet_result
+            total_portions = int(round(sum(buffet_result.values())))
             model_used = "ml"
             confidence = _calculate_confidence(
                 school_id, 1, float(total_portions), present_today, total_students, True
             )
         else:
-            total_portions = _base_formula_portions(present_today, buffer_percent)
+            # Fallback без буфера (буфер добавляет фронтенд)
+            total_portions = int(present_today)
             confidence = 0.50
     else:
         # Стандартная модель
         portions = _standard_prediction({
             "school_id": school_id,
-            "age_group": "middle",
+            "age_group": age_group,
             "month": month,
             "day_of_month": day_of_month,
             "day_of_week": day_of_week,
@@ -875,7 +878,8 @@ async def ml_predict(request: MLPredictRequest) -> MLPredictResponse:
                 school_id, 1, float(total_portions), present_today, total_students, True
             )
         else:
-            total_portions = _base_formula_portions(present_today, buffer_percent)
+            # Fallback без буфера (буфер добавляет фронтенд)
+            total_portions = int(present_today)
             confidence = 0.50
 
     # Многодневный прогноз
@@ -888,19 +892,21 @@ async def ml_predict(request: MLPredictRequest) -> MLPredictResponse:
         m = target.month
         d = target.day
         dw = target.weekday()
-        pre_h = 1 if dw == 4 else 0
-        pre_v = 1 if target.isoformat() in holiday_calendar else 0
+        # Календарные признаки для целевого дня
+        is_pre_holiday_d = 1 if dw == 4 else 0
+        is_holiday_calendar_d = 1 if target.isoformat() in holiday_calendar else 0
+        is_pre_vacation_d = 1 if (target + timedelta(days=1)).isoformat() in holiday_calendar else 0
 
         if meal_plan == "canteen":
             result = _buffet_prediction({
                 "school_id": school_id,
-                "age_group": "middle",
+                "age_group": age_group,
                 "month": m,
                 "day_of_month": d,
                 "day_of_week": dw,
-                "is_pre_holiday": pre_h,
-                "is_pre_vacation": pre_v,
-                "is_holiday_calendar": pre_v,
+                "is_pre_holiday": is_pre_holiday_d,
+                "is_pre_vacation": is_pre_vacation_d,
+                "is_holiday_calendar": is_holiday_calendar_d,
                 "main_dish": main_dish,
                 "total_students": total_students,
                 "opt_outs": opt_outs,
@@ -916,29 +922,32 @@ async def ml_predict(request: MLPredictRequest) -> MLPredictResponse:
                 "precipitation_mm": w["precipitation_mm"],
                 "is_rainy": w["is_rainy"],
                 "is_cold": w["is_cold"],
-                "sold_hot_yesterday": payload.get("yesterday_total_qty", 0) * 0.42,
-                "sold_salad_yesterday": payload.get("yesterday_total_qty", 0) * 0.18,
-                "sold_bakery_yesterday": payload.get("yesterday_total_qty", 0) * 0.22,
+                **{
+                    f"sold_{cat}_yesterday": payload.get("yesterday_total_qty", 0)
+                    * buffet_ratio_for(cat, age_group)
+                    for cat in BUFFET_CATEGORIES
+                },
             }, horizon=horizon)
 
             if result is not None:
-                day_portions = int(round(result["hot"] + result["salad"] + result["bakery"]))
+                day_portions = int(round(sum(result.values())))
                 day_conf = _calculate_confidence(
                     school_id, horizon, float(day_portions), present_today, total_students, True
                 )
             else:
-                day_portions = _base_formula_portions(present_today, buffer_percent)
+                # Fallback без буфера (буфер добавляет фронтенд)
+                day_portions = int(present_today)
                 day_conf = 0.50
         else:
             portions = _standard_prediction({
                 "school_id": school_id,
-                "age_group": "middle",
+                "age_group": age_group,
                 "month": m,
                 "day_of_month": d,
                 "day_of_week": dw,
-                "is_pre_holiday": pre_h,
-                "is_pre_vacation": pre_v,
-                "is_holiday_calendar": pre_v,
+                "is_pre_holiday": is_pre_holiday_d,
+                "is_pre_vacation": is_pre_vacation_d,
+                "is_holiday_calendar": is_holiday_calendar_d,
                 "main_dish": main_dish,
                 "total_students": total_students,
                 "opt_outs": opt_outs,
@@ -962,7 +971,8 @@ async def ml_predict(request: MLPredictRequest) -> MLPredictResponse:
                     school_id, horizon, portions, present_today, total_students, True
                 )
             else:
-                day_portions = _base_formula_portions(present_today, buffer_percent)
+                # Fallback без буфера (буфер добавляет фронтенд)
+                day_portions = int(present_today)
                 day_conf = 0.50
 
         forecast_days_list.append({
@@ -977,6 +987,7 @@ async def ml_predict(request: MLPredictRequest) -> MLPredictResponse:
         confidence=round(confidence, 2),
         forecast_days=forecast_days_list,
         model_used=model_used,
+        categories=buffet_categories,
     )
 
 

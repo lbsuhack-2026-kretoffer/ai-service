@@ -38,7 +38,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from catboost import CatBoostRegressor, Pool
-from sklearn.model_selection import train_test_split
 from sqlalchemy import create_engine
 
 warnings.filterwarnings("ignore", category=UserWarning, module="catboost")
@@ -66,6 +65,9 @@ from features import (
     MAIN_DISHES,
     DISH_POPULARITY,
     BUFFET_RATIOS,
+    BUFFET_CATEGORIES,
+    buffet_ratio_for,
+    _buffet_category_id,
     get_holiday_calendar,
 )
 
@@ -198,9 +200,12 @@ def load_backend_data(database_url: str | None = None) -> pd.DataFrame:
             month = att_date.month
             day_of_month = att_date.day
             day_of_week = att_date.weekday()  # 0=Пн, 6=Вс
-            is_pre_holiday = 1 if day_of_week == 4 else 0
-            is_pre_vacation = 1 if att_date in holiday_calendar else 0
+            # День сам по себе праздничный/каникулярный
             is_holiday_calendar_flag = 1 if att_date in holiday_calendar else 0
+            # День перед началом каникул/праздника (завтра уже каникулы)
+            is_pre_vacation = 1 if (att_date + timedelta(days=1)) in holiday_calendar else 0
+            # Предпраздничный день (пятница перед уик-эндом)
+            is_pre_holiday = 1 if day_of_week == 4 else 0
 
             # Погодные признаки (в БД нет — нейтральные значения,
             # реальная погода будет подтягиваться бэкендом при инференсе)
@@ -241,11 +246,12 @@ def load_backend_data(database_url: str | None = None) -> pd.DataFrame:
                 "date": att_date,
             }
 
-            # Для canteen-школ добавляем продажи вчера
+            # Для canteen-школ добавляем продажи вчера по категориям
             if meal_plan == "canteen":
                 y_date = att_date - timedelta(days=1)
-                cat_map = {"cat-hot": "sold_hot_yesterday", "cat-salad": "sold_salad_yesterday", "cat-bakery": "sold_bakery_yesterday"}
-                for cat_id, col in cat_map.items():
+                for cat in BUFFET_CATEGORIES:
+                    cat_id = _buffet_category_id(cat)
+                    col = f"sold_{cat}_yesterday"
                     sale = sales_df[
                         (sales_df["school_id"] == school_id)
                         & (sales_df["date"] == y_date)
@@ -272,17 +278,28 @@ def load_backend_data(database_url: str | None = None) -> pd.DataFrame:
     # Базовый таргет (h=1) для обратной совместимости
     df["target_portions_tomorrow"] = df["target_portions_h1"]
 
-    # Буфетные таргеты по горизонтам (для canteen-школ)
+    # Буфетные таргеты по горизонтам — реальные продажи по категориям из canteen_sales.
+    # Каждая категория предсказывается независимо (сумма не обязана быть равна 1).
     buffet_mask = df["meal_plan"] == "canteen"
-    if buffet_mask.any():
+    if buffet_mask.any() and not sales_df.empty:
+        sales_lookup = {
+            (row["school_id"], row["date"], row["category_id"]): int(row["qty"])
+            for _, row in sales_df.iterrows()
+        }
+        n_buffet = int(buffet_mask.sum())
         for h in HORIZONS:
-            target_col = f"target_portions_h{h}"
-            ratio_hot = BUFFET_RATIOS["hot"]
-            ratio_salad = BUFFET_RATIOS["salad"]
-            ratio_bakery = BUFFET_RATIOS["bakery"]
-            df.loc[buffet_mask, f"target_hot_h{h}"] = (df.loc[buffet_mask, target_col] * ratio_hot).astype(int)
-            df.loc[buffet_mask, f"target_salad_h{h}"] = (df.loc[buffet_mask, target_col] * ratio_salad).astype(int)
-            df.loc[buffet_mask, f"target_bakery_h{h}"] = (df.loc[buffet_mask, target_col] * ratio_bakery).astype(int)
+            target_dates = df.loc[buffet_mask, "date"] + timedelta(days=h)
+            schools_h = df.loc[buffet_mask, "school_id"]
+            for cat in BUFFET_CATEGORIES:
+                cat_id = _buffet_category_id(cat)
+                col = f"target_{cat}_h{h}"
+                keys = list(zip(schools_h, target_dates, [cat_id] * n_buffet))
+                df.loc[buffet_mask, col] = [sales_lookup.get(k, 0) for k in keys]
+    elif buffet_mask.any():
+        # Нет таблицы продаж — нулевые таргеты по категориям
+        for h in HORIZONS:
+            for cat in BUFFET_CATEGORIES:
+                df.loc[buffet_mask, f"target_{cat}_h{h}"] = 0
 
     logger.info(f"Построено записей для обучения: {len(df)}")
     return df
@@ -326,11 +343,6 @@ def _generate_synthetic_fallback() -> pd.DataFrame:
     dow_factor = {0: 1.02, 1: 1.00, 2: 0.98, 3: 0.95, 4: 0.85}
     age_factor_target = {"junior": 0.90, "middle": 1.00, "senior": 1.10}
 
-    age_hot = {"junior": 0.55, "middle": 0.60, "senior": 0.50}
-    age_salad = {"junior": 0.10, "middle": 0.20, "senior": 0.30}
-    age_bakery = {"junior": 0.35, "middle": 0.25, "senior": 0.20}
-
-    # Погода по месяцам
     month_weather = {
         9: {"temp": 14.0, "rain_prob": 0.30},
         10: {"temp": 9.0, "rain_prob": 0.40},
@@ -353,9 +365,9 @@ def _generate_synthetic_fallback() -> pd.DataFrame:
                 dow = att_date.weekday()
                 month = att_date.month
 
-                is_pre_holiday = 1 if (att_date in holiday_calendar or dow == 4) else 0
-                is_pre_vacation = 1 if att_date in holiday_calendar else 0
                 is_holiday_calendar_flag = 1 if att_date in holiday_calendar else 0
+                is_pre_vacation = 1 if (att_date + timedelta(days=1)) in holiday_calendar else 0
+                is_pre_holiday = 1 if dow == 4 else 0
 
                 total_students = max(10, class_size + np.random.randint(-2, 3))
                 opt_outs = max(0, min(opt_outs_base + np.random.randint(-1, 2), total_students))
@@ -446,36 +458,33 @@ def _generate_synthetic_fallback() -> pd.DataFrame:
         df[f"target_portions_h{h}"] = df[f"target_portions_h{h}"].fillna(df["present_today"])
     df["target_portions_tomorrow"] = df["target_portions_h1"]
 
-    # Буфетные фичи и таргеты для canteen-школ
+    # Буфетные фичи и таргеты для canteen-школ.
+    # Каждая категория независима — сумма не обязана быть равна 1.
     buffet_mask = df["meal_plan"] == "canteen"
     if buffet_mask.any():
+        n_buffet = int(buffet_mask.sum())
         for h in HORIZONS:
             target_col = f"target_portions_h{h}"
-            ratio_hot = BUFFET_RATIOS["hot"]
-            ratio_salad = BUFFET_RATIOS["salad"]
-            ratio_bakery = BUFFET_RATIOS["bakery"]
-            df.loc[buffet_mask, f"target_hot_h{h}"] = (df.loc[buffet_mask, target_col] * ratio_hot).astype(int)
-            df.loc[buffet_mask, f"target_salad_h{h}"] = (df.loc[buffet_mask, target_col] * ratio_salad).astype(int)
-            df.loc[buffet_mask, f"target_bakery_h{h}"] = (df.loc[buffet_mask, target_col] * ratio_bakery).astype(int)
+            for cat in BUFFET_CATEGORIES:
+                # Таргет категории = доля категории * общий таргет (симмулирует спрос)
+                ratios = df.loc[buffet_mask, "age_group"].map(
+                    lambda ag: buffet_ratio_for(cat, ag)
+                )
+                noise = np.random.uniform(0.85, 1.15, size=n_buffet)
+                df.loc[buffet_mask, f"target_{cat}_h{h}"] = (
+                    df.loc[buffet_mask, target_col] * ratios * noise
+                ).clip(lower=0).astype(int)
 
-        # Продажи вчера для canteen
-        df.loc[buffet_mask, "sold_hot_yesterday"] = (
-            df.loc[buffet_mask, "present_yesterday"]
-            * df.loc[buffet_mask, "age_group"].map(age_hot)
-            * np.random.uniform(0.85, 1.15, size=int(buffet_mask.sum()))
-        ).clip(lower=0).astype(int)
-
-        df.loc[buffet_mask, "sold_salad_yesterday"] = (
-            df.loc[buffet_mask, "present_yesterday"]
-            * df.loc[buffet_mask, "age_group"].map(age_salad)
-            * np.random.uniform(0.85, 1.15, size=int(buffet_mask.sum()))
-        ).clip(lower=0).astype(int)
-
-        df.loc[buffet_mask, "sold_bakery_yesterday"] = (
-            df.loc[buffet_mask, "present_yesterday"]
-            * df.loc[buffet_mask, "age_group"].map(age_bakery)
-            * np.random.uniform(0.85, 1.15, size=int(buffet_mask.sum()))
-        ).clip(lower=0).astype(int)
+        # Продажи вчера для canteen по категориям
+        for cat in BUFFET_CATEGORIES:
+            col = f"sold_{cat}_yesterday"
+            ratios = df.loc[buffet_mask, "age_group"].map(
+                lambda ag: buffet_ratio_for(cat, ag)
+            )
+            noise = np.random.uniform(0.85, 1.15, size=n_buffet)
+            df.loc[buffet_mask, col] = (
+                df.loc[buffet_mask, "present_yesterday"] * ratios * noise
+            ).clip(lower=0).astype(int)
 
     logger.info(f"Построено синтетических записей: {len(df)}")
     return df
@@ -530,6 +539,7 @@ def _fit_school_model(
     school_id: str,
     X_school: pd.DataFrame,
     y_school: pd.Series | pd.DataFrame,
+    dates_school: pd.Series,
     global_model: CatBoostRegressor,
     horizon: int,
     model_type: str = "standard",
@@ -540,9 +550,22 @@ def _fit_school_model(
         return None
 
     loss = "RMSE" if model_type == "standard" else "MultiRMSE"
-    X_s_train, X_s_test, y_s_train, y_s_test = train_test_split(
-        X_school, y_school, test_size=0.2, random_state=42
-    )
+
+    # Временной сплит: ранние даты на обучение, поздние — на валидацию (без утечки)
+    order = dates_school.argsort(kind="mergesort")
+    n = len(order)
+    n_train = int(n * 0.8)
+    if n_train < 1 or n - n_train < 1:
+        # Недостаточно данных для валидации — обучаем на всём
+        X_s_train, X_s_test = X_school, X_school.iloc[:0]
+        y_s_train, y_s_test = y_school, y_school.iloc[:0]
+    else:
+        train_idx = order[:n_train]
+        test_idx = order[n_train:]
+        X_s_train = X_school.iloc[train_idx]
+        X_s_test = X_school.iloc[test_idx]
+        y_s_train = y_school.iloc[train_idx]
+        y_s_test = y_school.iloc[test_idx]
 
     train_pool = _make_pool(X_s_train, CAT_FEATURES, label=y_s_train)
     test_pool = _make_pool(X_s_test, CAT_FEATURES, label=y_s_test)
@@ -591,9 +614,16 @@ def train_standard_models(df: pd.DataFrame) -> tuple:
         X = df[STANDARD_INPUT_FEATURES]
         y = df[target_col]
 
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, random_state=42, stratify=X["school_id"]
-        )
+        # Временной сплит: обучение на ранних датах, валидация на поздних (без утечки из будущего)
+        order = df["date"].argsort(kind="mergesort")
+        n = len(order)
+        n_train = int(n * 0.8)
+        train_idx = order[:n_train]
+        test_idx = order[n_train:]
+        X_train = X.iloc[train_idx]
+        X_test = X.iloc[test_idx]
+        y_train = y.iloc[train_idx]
+        y_test = y.iloc[test_idx]
 
         # 1. Глобальная модель для этого горизонта
         global_model = _fit_global_model(X_train, y_train, X_test, y_test, h, model_type="standard")
@@ -610,7 +640,9 @@ def train_standard_models(df: pd.DataFrame) -> tuple:
         school_models_h: dict[int, CatBoostRegressor] = {}
         for school_id in all_school_ids:
             mask = X["school_id"] == school_id
-            model = _fit_school_model(school_id, X[mask], y[mask], global_model, h, model_type="standard")
+            model = _fit_school_model(
+                school_id, X[mask], y[mask], df.loc[mask, "date"], global_model, h, model_type="standard"
+            )
             if model is not None:
                 school_models_h[school_id] = model
 
@@ -645,7 +677,7 @@ def train_buffet_models(df: pd.DataFrame) -> tuple:
         return global_buffet_models, school_buffet_models_all
 
     for h in HORIZONS:
-        target_cols = [f"target_hot_h{h}", f"target_salad_h{h}", f"target_bakery_h{h}"]
+        target_cols = [f"target_{cat}_h{h}" for cat in BUFFET_CATEGORIES]
         logger.info(f"\n--- Горизонт h={h} (таргеты: {target_cols}) ---")
 
         X = buffet_df[BUFFET_INPUT_FEATURES]
@@ -681,7 +713,13 @@ def train_buffet_models(df: pd.DataFrame) -> tuple:
         for school_id in all_school_ids:
             mask = X["school_id"] == school_id
             model = _fit_school_model(
-                school_id, X[mask], y[mask], model, h, model_type="buffet"
+                school_id,
+                X[mask],
+                y[mask],
+                buffet_df.loc[mask, "date"],
+                model,
+                h,
+                model_type="buffet",
             )
             if model is not None:
                 school_models_h[school_id] = model

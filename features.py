@@ -4,14 +4,37 @@
 Оба файла — train.py и main.py — импортируют списки фичей отсюда.
 Это гарантирует, что на обучении и инференсе используются одинаковые признаки
 в одинаковом порядке.
+
+Категории шведского стола настраиваются через переменную окружения
+BUFFET_CATEGORIES (список через запятую), например:
+    BUFFET_CATEGORIES=hot,salad,bakery,soup,dessert
+По умолчанию: hot, salad, bakery.
+Сумма долей категорий НЕ обязана быть равна единице — каждый ученик берёт
+то, что хочет (кто-то ничего, кто-то две котлеты). Каждая категория
+предсказывается независимо как абсолютное количество порций.
 """
 
 from __future__ import annotations
+
+import os as _os
+import json as _json
 
 # ---------------------------------------------------------------------------
 # Горизонты прогноза (дней вперёд)
 # ---------------------------------------------------------------------------
 HORIZONS = [1, 2, 3, 4, 5]
+
+# ---------------------------------------------------------------------------
+# Категории шведского стола (динамические, из окружения)
+# ---------------------------------------------------------------------------
+_DEFAULT_BUFFET_CATEGORIES = ["hot", "salad", "bakery"]
+_BUFFET_CATEGORIES_ENV = _os.getenv("BUFFET_CATEGORIES", ",".join(_DEFAULT_BUFFET_CATEGORIES))
+BUFFET_CATEGORIES = [c.strip() for c in _BUFFET_CATEGORIES_ENV.split(",") if c.strip()] or _DEFAULT_BUFFET_CATEGORIES
+
+# Отображение категории -> код категории в таблице canteen_sales бэкенда.
+# По умолчанию category_id = "cat-{имя категории}".
+def _buffet_category_id(category: str) -> str:
+    return f"cat-{category}"
 
 # ---------------------------------------------------------------------------
 # Категориальные признаки (передаются в CatBoost напрямую, без One-Hot Encoding)
@@ -51,13 +74,10 @@ NUMERIC_FEATURES_STANDARD = [
 ]
 
 # ---------------------------------------------------------------------------
-# Числовые признаки (шведский стол — стандарт + продажи вчера)
+# Числовые признаки (шведский стол — стандарт + продажи вчера по категориям)
 # ---------------------------------------------------------------------------
-NUMERIC_FEATURES_BUFFET = NUMERIC_FEATURES_STANDARD + [
-    "sold_hot_yesterday",
-    "sold_salad_yesterday",
-    "sold_bakery_yesterday",
-]
+BUFFET_SOLD_FEATURES = [f"sold_{cat}_yesterday" for cat in BUFFET_CATEGORIES]
+NUMERIC_FEATURES_BUFFET = NUMERIC_FEATURES_STANDARD + BUFFET_SOLD_FEATURES
 
 # ---------------------------------------------------------------------------
 # Полный список входных фичей (строго в порядке обучения)
@@ -69,11 +89,7 @@ BUFFET_INPUT_FEATURES = CAT_FEATURES + BINARY_FEATURES + NUMERIC_FEATURES_BUFFET
 # Таргеты
 # ---------------------------------------------------------------------------
 TARGET_STANDARD = "target_portions_tomorrow"  # базовый таргет (h=1)
-TARGETS_BUFFET = [
-    "target_hot_tomorrow",
-    "target_salad_tomorrow",
-    "target_bakery_tomorrow",
-]
+TARGETS_BUFFET = [f"target_{cat}_tomorrow" for cat in BUFFET_CATEGORIES]
 
 # ---------------------------------------------------------------------------
 # Возрастные группы
@@ -111,23 +127,34 @@ DISH_POPULARITY = {
 }
 
 # ---------------------------------------------------------------------------
-# Доли категорий буфета (используются только в синтетике и как стартовое
-# приближение; в реальном обучении модель учит свои доли)
+# Доли категорий буфета для СИНТЕТИЧЕСКОЙ генерации данных.
+# Каждая категория независима, сумма не обязана быть равна 1.0.
+# Используются только при генерации fallback-данных, не при инференсе.
 # ---------------------------------------------------------------------------
 BUFFET_RATIOS = {
     "hot": 0.42,
     "salad": 0.18,
     "bakery": 0.22,
-    "drink": 0.18,
 }
+
+# Возрастные коэффициенты по категориям для синтетики (не суммируются в 1).
+BUFFET_CATEGORY_AGE_RATIOS = {
+    "junior": {"hot": 0.55, "salad": 0.10, "bakery": 0.35},
+    "middle": {"hot": 0.60, "salad": 0.20, "bakery": 0.25},
+    "senior": {"hot": 0.50, "salad": 0.30, "bakery": 0.20},
+}
+
+
+def buffet_ratio_for(category: str, age_group: str = "middle") -> float:
+    """Доля категории для заданной возрастной группы (синтетика/фолбэк)."""
+    age_map = BUFFET_CATEGORY_AGE_RATIOS.get(age_group, BUFFET_CATEGORY_AGE_RATIOS["middle"])
+    return float(age_map.get(category, BUFFET_RATIOS.get(category, 0.25)))
+
 
 # ---------------------------------------------------------------------------
 # Календарь каникул и праздников (ISO даты)
 # Можно расширять из переменной окружения HOLIDAY_CALENDAR (JSON со списком дат)
 # ---------------------------------------------------------------------------
-import os as _os
-import json as _json
-
 _PRESET_HOLIDAYS = {
     "2026-10-30",  # предпраздничный
     "2026-10-31",  # каникулы
