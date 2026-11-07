@@ -76,22 +76,6 @@ MODELS_DIR.mkdir(exist_ok=True)
 
 MODEL_VERSION = "v2"
 
-# Файл с меткой даты последнего успешного обучения (ISO-дата, YYYY-MM-DD)
-LAST_TRAIN_FILE = MODELS_DIR / ".last_train"
-
-# --- Параметры первичного обучения (с нуля) ---
-PRIMARY_ITERATIONS = 600
-PRIMARY_LEARNING_RATE = 0.05
-PRIMARY_EARLY_STOPPING_ROUNDS = 50
-PRIMARY_VERBOSE = 100
-
-# --- Параметры инкрементального дообучения (мягче, чем первичное обучение) ---
-RETRAIN_ITERATIONS = 150
-RETRAIN_LEARNING_RATE = 0.02
-RETRAIN_DEPTH = 6
-RETRAIN_EARLY_STOPPING_ROUNDS = 30
-RETRAIN_VERBOSE = 50
-
 STANDARD_GLOBAL_MODEL_PATHS = {
     h: MODELS_DIR / f"standard_global_model_{MODEL_VERSION}_h{h}.cbm" for h in HORIZONS
 }
@@ -112,42 +96,6 @@ TOP_SCHOOLS_COUNT = 10
 def set_seed(seed: int = 42) -> None:
     """Фиксация случайности для воспроизводимости."""
     np.random.seed(seed)
-
-
-def read_last_train_date() -> date | None:
-    """
-    Дата последнего успешного обучения.
-
-    Приоритет: файл models/.last_train (ISO-дата). Если файла нет —
-    mtime самого свежего .cbm файла в models/. Возвращает None, если
-    ничего не найдено (первичное обучение с нуля).
-    """
-    if LAST_TRAIN_FILE.exists():
-        try:
-            return date.fromisoformat(LAST_TRAIN_FILE.read_text(encoding="utf-8").strip())
-        except (ValueError, OSError):
-            pass
-    cbm_files = list(MODELS_DIR.glob("*.cbm"))
-    if not cbm_files:
-        return None
-    latest_mtime = max(f.stat().st_mtime for f in cbm_files)
-    return date.fromtimestamp(latest_mtime)
-
-
-def write_last_train_date() -> None:
-    """Записывает ISO-дату сегодняшнего дня в models/.last_train."""
-    LAST_TRAIN_FILE.write_text(date.today().isoformat(), encoding="utf-8")
-    logger.info(f"Метка последнего обучения обновлена: {LAST_TRAIN_FILE}")
-
-
-def _load_model_if_exists(path: Path) -> CatBoostRegressor | None:
-    """Загружает существующую модель для дообучения (init_model), или None."""
-    if not path.exists():
-        return None
-    model = CatBoostRegressor()
-    model.load_model(str(path))
-    logger.info(f"Загружена существующая модель для дообучения: {path}")
-    return model
 
 
 def load_backend_data(database_url: str | None = None) -> pd.DataFrame:
@@ -222,7 +170,7 @@ def load_backend_data(database_url: str | None = None) -> pd.DataFrame:
 
             class_students = students_df[students_df["class_id"] == class_id]
             total_students = len(class_students)
-            opt_outs = len(class_students[class_students["meal_status"] == "optOut"])
+            opt_outs = len(class_students[class_students["meal_status"] == "opt_out"])
 
             absent_ids = set(att.get("absent_student_ids", []) or [])
             regular_ids = set(class_students[class_students["meal_status"] == "regular"]["id"])
@@ -381,12 +329,12 @@ def _generate_synthetic_fallback() -> pd.DataFrame:
             "address": "",
         })
         classes_per_school[sid] = [
-            (f"{g}{i}", ag, size)
-            for i, (g, ag, size) in enumerate([
-                ("1", "junior", 25), ("2", "junior", 24),
-                ("5", "middle", 28), ("6", "middle", 27),
-                ("9", "senior", 26), ("10", "senior", 25),
-            ][:synth_classes_per_school], start=1)
+            (f"{g}{l}", ag, size)
+            for g, l, ag, size in [
+                ("1", "А", "junior", 25), ("2", "Б", "junior", 24),
+                ("5", "А", "middle", 28), ("6", "Б", "middle", 27),
+                ("9", "А", "senior", 26), ("10", "Б", "senior", 25),
+            ][:synth_classes_per_school]
         ]
 
     start_date = date(2026, 9, 1)
@@ -566,55 +514,28 @@ def _make_pool(
 
 
 def _fit_global_model(
-    X_train,
-    y_train,
-    X_test,
-    y_test,
-    horizon: int,
-    model_type: str = "standard",
-    init_model: CatBoostRegressor | None = None,
+    X_train, y_train, X_test, y_test, horizon: int, model_type: str = "standard"
 ) -> CatBoostRegressor:
-    """
-    Обучает глобальную модель CatBoostRegressor для заданного горизонта.
-
-    Если передан init_model — выполняется инкрементальное дообучение с
-    более мягкими гиперпараметрами (iterations=150, learning_rate=0.02 и т.д.),
-    иначе — первичное обучение с нуля (iterations=600, learning_rate=0.05).
-    """
+    """Обучает глобальную модель CatBoostRegressor для заданного горизонта."""
     loss = "RMSE" if model_type == "standard" else "MultiRMSE"
     eval_metric = "RMSE" if model_type == "standard" else "MultiRMSE"
-
-    if init_model is not None:
-        iterations = RETRAIN_ITERATIONS
-        learning_rate = RETRAIN_LEARNING_RATE
-        early_stopping_rounds = RETRAIN_EARLY_STOPPING_ROUNDS
-        verbose = RETRAIN_VERBOSE
-        logger.info(
-            f"Инкрементное дообучение глобальной {model_type} модели "
-            f"(h={horizon}, {loss}, init_model передан)..."
-        )
-    else:
-        iterations = PRIMARY_ITERATIONS
-        learning_rate = PRIMARY_LEARNING_RATE
-        early_stopping_rounds = PRIMARY_EARLY_STOPPING_ROUNDS
-        verbose = PRIMARY_VERBOSE
-        logger.info(f"Обучение глобальной {model_type} модели с нуля (h={horizon}, {loss})...")
+    logger.info(f"Обучение глобальной {model_type} модели (h={horizon}, {loss})...")
 
     train_pool = _make_pool(X_train, CAT_FEATURES, label=y_train)
     test_pool = _make_pool(X_test, CAT_FEATURES, label=y_test)
 
     model = CatBoostRegressor(
-        iterations=iterations,
-        learning_rate=learning_rate,
-        depth=RETRAIN_DEPTH,
+        iterations=600,
+        learning_rate=0.05,
+        depth=6,
         loss_function=loss,
         eval_metric=eval_metric,
         random_seed=42,
-        verbose=verbose,
-        early_stopping_rounds=early_stopping_rounds,
+        verbose=100,
+        early_stopping_rounds=50,
         allow_writing_files=False,
     )
-    model.fit(train_pool, eval_set=test_pool, init_model=init_model, use_best_model=True)
+    model.fit(train_pool, eval_set=test_pool, use_best_model=True)
 
     logger.info(
         f"Глобальная {model_type} модель h={horizon}: best_iteration={model.best_iteration_}, "
@@ -628,17 +549,11 @@ def _fit_school_model(
     X_school: pd.DataFrame,
     y_school: pd.Series | pd.DataFrame,
     dates_school: pd.Series,
+    global_model: CatBoostRegressor,
     horizon: int,
     model_type: str = "standard",
-    init_model: CatBoostRegressor | None = None,
 ) -> CatBoostRegressor | None:
-    """
-    Дообучение модели для конкретной школы.
-
-    Если передан init_model — инкрементальное дообучение с мягкими
-    гиперпараметрами (iterations=150, learning_rate=0.02 и т.д.),
-    иначе — первичное обучение с нуля (iterations=300, learning_rate=0.03).
-    """
+    """Дообучение модели для конкретной школы через Transfer Learning."""
     if len(X_school) < 10:
         logger.warning(f"Для {school_id} h={horizon} мало данных ({len(X_school)}), пропускаем")
         return None
@@ -664,37 +579,21 @@ def _fit_school_model(
     train_pool = _make_pool(X_s_train, CAT_FEATURES, label=y_s_train)
     test_pool = _make_pool(X_s_test, CAT_FEATURES, label=y_s_test)
 
-    if init_model is not None:
-        iterations = RETRAIN_ITERATIONS
-        learning_rate = RETRAIN_LEARNING_RATE
-        early_stopping_rounds = RETRAIN_EARLY_STOPPING_ROUNDS
-        verbose = RETRAIN_VERBOSE
-        logger.info(
-            f"Инкрементное дообучение {school_id} {model_type} h={horizon} "
-            f"(init_model передан, {loss})..."
-        )
-    else:
-        iterations = 300
-        learning_rate = 0.03
-        early_stopping_rounds = 30
-        verbose = 50
-        logger.info(f"Обучение {school_id} {model_type} h={horizon} с нуля...")
-
     fine_tuned = CatBoostRegressor(
-        iterations=iterations,
-        learning_rate=learning_rate,
-        depth=RETRAIN_DEPTH,
+        iterations=300,
+        learning_rate=0.03,
+        depth=6,
         loss_function=loss,
         eval_metric=loss,
         random_seed=42,
-        verbose=verbose,
-        early_stopping_rounds=early_stopping_rounds,
+        verbose=50,
+        early_stopping_rounds=30,
         allow_writing_files=False,
     )
     fine_tuned.fit(
         train_pool,
         eval_set=test_pool,
-        init_model=init_model,
+        init_model=global_model,
         use_best_model=True,
     )
 
@@ -735,11 +634,8 @@ def train_standard_models(df: pd.DataFrame) -> tuple:
         y_train = y.iloc[train_idx]
         y_test = y.iloc[test_idx]
 
-        # 1. Глобальная модель для этого горизонта (дообучение на существующей, если есть)
-        global_init = _load_model_if_exists(STANDARD_GLOBAL_MODEL_PATHS[h])
-        global_model = _fit_global_model(
-            X_train, y_train, X_test, y_test, h, model_type="standard", init_model=global_init
-        )
+        # 1. Глобальная модель для этого горизонта
+        global_model = _fit_global_model(X_train, y_train, X_test, y_test, h, model_type="standard")
         global_models[h] = global_model
 
         # Сохранение глобальной модели
@@ -753,16 +649,8 @@ def train_standard_models(df: pd.DataFrame) -> tuple:
         school_models_h: dict[int, CatBoostRegressor] = {}
         for school_id in all_school_ids:
             mask = X["school_id"] == school_id
-            school_init_path = MODELS_DIR / f"{school_id}_model_{MODEL_VERSION}_h{h}.cbm"
-            school_init = _load_model_if_exists(school_init_path)
             model = _fit_school_model(
-                school_id,
-                X[mask],
-                y[mask],
-                df.loc[mask, "date"],
-                h,
-                model_type="standard",
-                init_model=school_init,
+                school_id, X[mask], y[mask], df.loc[mask, "date"], global_model, h, model_type="standard"
             )
             if model is not None:
                 school_models_h[school_id] = model
@@ -806,37 +694,18 @@ def train_buffet_models(df: pd.DataFrame) -> tuple:
 
         train_pool = _make_pool(X, CAT_FEATURES, label=y.to_numpy())
 
-        # 1. Глобальная буфетная модель для этого горизонта
-        buffet_init = _load_model_if_exists(BUFFET_MODEL_PATHS[h])
-        if buffet_init is not None:
-            model = CatBoostRegressor(
-                iterations=RETRAIN_ITERATIONS,
-                learning_rate=RETRAIN_LEARNING_RATE,
-                depth=RETRAIN_DEPTH,
-                loss_function="MultiRMSE",
-                eval_metric="MultiRMSE",
-                random_seed=42,
-                verbose=RETRAIN_VERBOSE,
-                early_stopping_rounds=RETRAIN_EARLY_STOPPING_ROUNDS,
-                allow_writing_files=False,
-            )
-            logger.info(
-                f"Инкрементное дообучение буфетной глобальной модели h={h} (init_model передан)..."
-            )
-        else:
-            model = CatBoostRegressor(
-                iterations=600,
-                learning_rate=0.05,
-                depth=6,
-                loss_function="MultiRMSE",
-                eval_metric="MultiRMSE",
-                random_seed=42,
-                verbose=100,
-                early_stopping_rounds=50,
-                allow_writing_files=False,
-            )
-            logger.info(f"Обучение буфетной глобальной модели h={h} с нуля...")
-        model.fit(train_pool, init_model=buffet_init, use_best_model=True)
+        model = CatBoostRegressor(
+            iterations=600,
+            learning_rate=0.05,
+            depth=6,
+            loss_function="MultiRMSE",
+            eval_metric="MultiRMSE",
+            random_seed=42,
+            verbose=100,
+            early_stopping_rounds=50,
+            allow_writing_files=False,
+        )
+        model.fit(train_pool, use_best_model=True)
 
         logger.info(
             f"Буфетная глобальная модель h={h}: best_iteration={model.best_iteration_}"
@@ -852,16 +721,14 @@ def train_buffet_models(df: pd.DataFrame) -> tuple:
         school_models_h: dict[int, CatBoostRegressor] = {}
         for school_id in all_school_ids:
             mask = X["school_id"] == school_id
-            school_init_path = MODELS_DIR / f"{school_id}_buffet_model_{MODEL_VERSION}_h{h}.cbm"
-            school_init = _load_model_if_exists(school_init_path)
             model = _fit_school_model(
                 school_id,
                 X[mask],
                 y[mask],
                 buffet_df.loc[mask, "date"],
+                model,
                 h,
                 model_type="buffet",
-                init_model=school_init,
             )
             if model is not None:
                 school_models_h[school_id] = model
@@ -885,31 +752,11 @@ def main() -> None:
 
     df = load_backend_data()
 
-    # 1. Инкрементальное обучение: только данные, появившиеся после последнего обучения
-    last_train_date = read_last_train_date()
-    if last_train_date is not None:
-        n_before = len(df)
-        df = df[df["date"] > last_train_date].copy()
-        logger.info(
-            f"Инкрементное обучение: последнее обучение {last_train_date}, "
-            f"записей {n_before} -> {len(df)} после фильтрации по дате"
-        )
-        if df.empty:
-            logger.warning(
-                f"Новых данных после {last_train_date} нет — обучение пропущено"
-            )
-            return
-    else:
-        logger.info("Предыдущего обучения не найдено — первичное обучение с нуля")
-
-    # 2. Стандартное питание (многогоризонт)
+    # 1. Стандартное питание (многогоризонт)
     global_models, school_models_all = train_standard_models(df)
 
-    # 3. Шведский стол (многогоризонт, с дообучением по школам)
+    # 2. Шведский стол (многогоризонт, с дообучением по школам)
     global_buffet_models, school_buffet_models_all = train_buffet_models(df)
-
-    # 5. Обновляем метку последнего успешного обучения
-    write_last_train_date()
 
     logger.info("=" * 60)
     logger.info("ОБУЧЕНИЕ ЗАВЕРШЕНО УСПЕШНО")
