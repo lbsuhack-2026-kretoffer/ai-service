@@ -19,6 +19,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # Копируем исходники и модели
 COPY train.py .
 COPY main.py .
+COPY features.py .
 COPY models/ ./models/
 
 # Запуск через uvicorn
