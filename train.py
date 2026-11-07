@@ -381,12 +381,12 @@ def _generate_synthetic_fallback() -> pd.DataFrame:
             "address": "",
         })
         classes_per_school[sid] = [
-            (f"{g}{l}", ag, size)
-            for g, ag, size in [
+            (f"{g}{i}", ag, size)
+            for i, (g, ag, size) in enumerate([
                 ("1", "junior", 25), ("2", "junior", 24),
                 ("5", "middle", 28), ("6", "middle", 27),
                 ("9", "senior", 26), ("10", "senior", 25),
-            ][:synth_classes_per_school]
+            ][:synth_classes_per_school], start=1)
         ]
 
     start_date = date(2026, 9, 1)

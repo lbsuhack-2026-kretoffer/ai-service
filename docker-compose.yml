@@ -11,3 +11,14 @@ services:
     restart: unless-stopped
     environment:
       - PYTHONUNBUFFERED=1
+
+  ai-trainer:
+    build: .
+    container_name: school-balance-pit-ai-trainer
+    volumes:
+      - ./models:/app/models
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
+      - DATABASE_URL=postgresql+psycopg2://school:school@db:5432/school_balance
+    command: sh -c "while true; do python train.py; sleep 86400; done"

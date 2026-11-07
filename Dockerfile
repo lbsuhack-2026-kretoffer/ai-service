@@ -16,13 +16,11 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Копируем исходники и модели
+# Копируем исходники (модели не копируем в образ — приезжают через volume или обучаются внутри контейнера)
 COPY train.py .
 COPY main.py .
 COPY features.py .
-COPY models/ ./models/
 
 # Запуск через uvicorn
 EXPOSE 8000
-
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
