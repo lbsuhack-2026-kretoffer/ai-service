@@ -35,18 +35,9 @@ ai-service/
 
 Модельные файлы `.cbm` не отслеживаются гитом (в `.gitignore`), обучаются через `train.py`.
 
-## Школы в бэкенде
+## Школы
 
-| ID школы | Название | meal_plan | Модель |
-|----------|----------|-----------|--------|
-| `school-a` | Гимназия №12 | `fixed` (стандартное) | `school-a_model_v2_h{1..5}.cbm` |
-| `school-b` | Средняя школа №34 | `canteen` (шведский стол) | `school-b_model_v2_h{1..5}.cbm` + `school-b_buffet_model_v2_h{1..5}.cbm` |
-| `school-c` | Лицей №7 | `fixed` | `school-c_model_v2_h{1..5}.cbm` |
-| `school-d` | Школа №101 | `canteen` | `school-d_model_v2_h{1..5}.cbm` + `school-d_buffet_model_v2_h{1..5}.cbm` |
-| `school-e` | Гимназия №5 | `fixed` | `school-e_model_v2_h{1..5}.cbm` |
-| `school-f` | Школа №22 | `canteen` | `school-f_model_v2_h{1..5}.cbm` + `school-f_buffet_model_v2_h{1..5}.cbm` |
-
-Неизвестные школы используют **глобальную модель** (`standard_global_model_v2_h{1..5}.cbm`) как fallback.
+Школы не захардкожены — список берётся из базы бэкенда (таблица `schools`). Любая школа, зарегистрированная в бэкенде, автоматически доступна для прогнозирования. При отсутствии дообученной модели для школы используется глобальная модель как fallback.
 
 ## Переменные окружения
 

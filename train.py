@@ -64,7 +64,6 @@ from features import (
     COLD_THRESHOLD,
     MAIN_DISHES,
     DISH_POPULARITY,
-    BUFFET_RATIOS,
     BUFFET_CATEGORIES,
     buffet_ratio_for,
     _buffet_category_id,
@@ -310,23 +309,33 @@ def _generate_synthetic_fallback() -> pd.DataFrame:
     logger.info("Генерация синтетических данных (fallback, v2.1)...")
     np.random.seed(42)
 
-    schools = [
-        {"school_id": "school-a", "name": "Гимназия №12", "meal_plan": "fixed", "baseline": 0.95, "city": "Минск", "address": "ул. Кальварийская, 12"},
-        {"school_id": "school-b", "name": "Средняя школа №34", "meal_plan": "canteen", "baseline": 1.05, "city": "Минск", "address": "пр-т Независимости, 34"},
-        {"school_id": "school-c", "name": "Лицей №7", "meal_plan": "fixed", "baseline": 0.90, "city": "Минск", "address": "пр-т Победителей, 7"},
-        {"school_id": "school-d", "name": "Школа №101", "meal_plan": "canteen", "baseline": 1.10, "city": "Минск", "address": "ул. Независимости, 101"},
-        {"school_id": "school-e", "name": "Гимназия №5", "meal_plan": "fixed", "baseline": 0.85, "city": "Минск", "address": "ул. Ленина, 5"},
-        {"school_id": "school-f", "name": "Школа №22", "meal_plan": "canteen", "baseline": 1.00, "city": "Минск", "address": "ул. Каспийская, 22"},
-    ]
+    # Школы не захардкожены — генерируются параметризованно из env.
+    # SYNTHETIC_SCHOOLS_COUNT — число школ, SYNTHETIC_CLASSES_PER_SCHOOL — классов на школу.
+    synth_schools_count = int(os.getenv("SYNTHETIC_SCHOOLS_COUNT", "6"))
+    synth_classes_per_school = int(os.getenv("SYNTHETIC_CLASSES_PER_SCHOOL", "6"))
 
-    classes_per_school = {
-        "school-a": [("1A", "junior", 25), ("1B", "junior", 24), ("5A", "middle", 28), ("5B", "middle", 27), ("9A", "senior", 26), ("9B", "senior", 25)],
-        "school-b": [("2A", "junior", 30), ("2B", "junior", 29), ("6A", "middle", 31), ("6B", "middle", 30), ("10A", "senior", 29), ("10B", "senior", 28)],
-        "school-c": [("3A", "junior", 22), ("3B", "junior", 23), ("7A", "middle", 25), ("7B", "middle", 24), ("11A", "senior", 23), ("11B", "senior", 22)],
-        "school-d": [("4A", "junior", 28), ("4B", "junior", 27), ("8A", "middle", 29), ("8B", "middle", 28), ("10A", "senior", 27), ("10B", "senior", 26)],
-        "school-e": [("1A", "junior", 20), ("1B", "junior", 21), ("5A", "middle", 23), ("5B", "middle", 22), ("9A", "senior", 21), ("9B", "senior", 20)],
-        "school-f": [("2A", "junior", 26), ("2B", "junior", 25), ("6A", "middle", 27), ("6B", "middle", 26), ("10A", "senior", 25), ("10B", "senior", 24)],
-    }
+    schools = []
+    classes_per_school = {}
+    for i in range(1, synth_schools_count + 1):
+        sid = f"school-{i}"
+        meal_plan = "canteen" if i % 2 == 0 else "fixed"
+        baseline = round(0.85 + 0.05 * (i % 4), 2)
+        schools.append({
+            "school_id": sid,
+            "name": f"Школа №{i}",
+            "meal_plan": meal_plan,
+            "baseline": baseline,
+            "city": "",
+            "address": "",
+        })
+        classes_per_school[sid] = [
+            (f"{g}{l}", ag, size)
+            for g, ag, size in [
+                ("1", "junior", 25), ("2", "junior", 24),
+                ("5", "middle", 28), ("6", "middle", 27),
+                ("9", "senior", 26), ("10", "senior", 25),
+            ][:synth_classes_per_school]
+        ]
 
     start_date = date(2026, 9, 1)
     end_date = date(2026, 12, 18)
