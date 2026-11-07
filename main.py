@@ -66,8 +66,9 @@ BUFFET_MODEL_PATHS = {
 # Глобальные переменные моделей
 # ---------------------------------------------------------------------------
 standard_global_models: Dict[int, CatBoostRegressor] = {}  # horizon -> model
-buffet_models: Dict[int, CatBoostRegressor] = {}  # horizon -> model
-school_models: Dict[str, Dict[int, CatBoostRegressor]] = {}  # school_id -> {horizon: model}
+buffet_models: Dict[int, CatBoostRegressor] = {}  # horizon -> model (global)
+school_models: Dict[str, Dict[int, CatBoostRegressor]] = {}  # school_id -> {horizon: model} (standard)
+school_buffet_models: Dict[str, Dict[int, CatBoostRegressor]] = {}  # school_id -> {horizon: model} (buffet)
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -95,6 +96,7 @@ def load_models() -> None:
     new_global_models: Dict[int, CatBoostRegressor] = {}
     new_buffet_models: Dict[int, CatBoostRegressor] = {}
     new_school_models: Dict[str, Dict[int, CatBoostRegressor]] = {}
+    new_school_buffet_models: Dict[str, Dict[int, CatBoostRegressor]] = {}
 
     # Глобальные модели по горизонтам
     for h in HORIZONS:
@@ -110,13 +112,15 @@ def load_models() -> None:
         if model is not None:
             new_buffet_models[h] = model
 
-    # Дообученные модели школ по горизонтам (исключаем буфетные и глобальные)
+    # Дообученные стандартные модели школ по горизонтам (исключаем буфетные и глобальные)
     pattern = re.compile(r"^(.+)_model_v2_h(\d+)\.cbm$")
     excluded_prefixes = ("standard_global_model", "buffet_model", "standard_model")
     for model_file in MODELS_DIR.glob("*_model_v2_h*.cbm"):
         name = model_file.name
         if any(name.startswith(p) for p in excluded_prefixes):
             continue
+        if "_buffet_model_" in name:
+            continue  # буфетные школьные модели загружаются отдельно
         match = pattern.match(name)
         if not match:
             continue
@@ -126,15 +130,30 @@ def load_models() -> None:
         model.load_model(str(model_file))
         new_school_models.setdefault(school_id, {})[horizon] = model
 
+    # Дообученные буфетные модели школ по горизонтам
+    buffet_pattern = re.compile(r"^(.+)_buffet_model_v2_h(\d+)\.cbm$")
+    for model_file in MODELS_DIR.glob("*_buffet_model_v2_h*.cbm"):
+        name = model_file.name
+        match = buffet_pattern.match(name)
+        if not match:
+            continue
+        school_id = match.group(1)
+        horizon = int(match.group(2))
+        model = CatBoostRegressor()
+        model.load_model(str(model_file))
+        new_school_buffet_models.setdefault(school_id, {})[horizon] = model
+
     # Атомарное присваивание globals
     standard_global_models = new_global_models
     buffet_models = new_buffet_models
     school_models = new_school_models
+    school_buffet_models = new_school_buffet_models
 
     logger.info(
         f"Модели загружены: стандартные горизонты {sorted(standard_global_models.keys())}, "
         f"буфетные горизонты {sorted(buffet_models.keys())}, "
-        f"школ {len(school_models)}"
+        f"школ (standard) {len(school_models)}, "
+        f"школ (buffet) {len(school_buffet_models)}"
     )
 
 
@@ -177,13 +196,16 @@ def _get_school_model(
     school_id: str, horizon: int, model_type: str = "standard"
 ) -> CatBoostRegressor | None:
     """Возвращает модель для школы и горизонта (с fallback на глобальную)."""
-    school_horizon_models = school_models.get(school_id, {})
-    if horizon in school_horizon_models:
-        return school_horizon_models[horizon]
-
     if model_type == "standard":
+        school_horizon_models = school_models.get(school_id, {})
+        if horizon in school_horizon_models:
+            return school_horizon_models[horizon]
         return standard_global_models.get(horizon)
     else:
+        # buffet
+        school_horizon_models = school_buffet_models.get(school_id, {})
+        if horizon in school_horizon_models:
+            return school_horizon_models[horizon]
         return buffet_models.get(horizon)
 
 

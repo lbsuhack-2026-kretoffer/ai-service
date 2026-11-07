@@ -603,13 +603,12 @@ def train_standard_models(df: pd.DataFrame) -> tuple:
         global_model.save_model(str(STANDARD_GLOBAL_MODEL_PATHS[h]))
         logger.info(f"Глобальная модель h={h}: {STANDARD_GLOBAL_MODEL_PATHS[h]}")
 
-        # 2. Дообучение для топ-школь
-        school_counts = X["school_id"].value_counts()
-        top_school_ids = school_counts.head(TOP_SCHOOLS_COUNT).index.tolist()
-        logger.info(f"Школы для дообучения h={h}: {top_school_ids}")
+        # 2. Дообучение для ВСЕХ школ с достаточным количеством данных
+        all_school_ids = X["school_id"].unique().tolist()
+        logger.info(f"Школы для дообучения h={h}: {all_school_ids}")
 
         school_models_h: dict[int, CatBoostRegressor] = {}
-        for school_id in top_school_ids:
+        for school_id in all_school_ids:
             mask = X["school_id"] == school_id
             model = _fit_school_model(school_id, X[mask], y[mask], global_model, h, model_type="standard")
             if model is not None:
@@ -628,20 +627,22 @@ def train_standard_models(df: pd.DataFrame) -> tuple:
     return global_models, school_models_all
 
 
-def train_buffet_models(df: pd.DataFrame) -> dict[int, CatBoostRegressor]:
+def train_buffet_models(df: pd.DataFrame) -> tuple:
     """
     Обучение буфетных моделей по всем горизонтам h=1..5.
-    Возвращает dict horizon->model.
+    Возвращает (dict horizon->global_model, dict school_id->dict horizon->model).
     """
     logger.info("=" * 60)
     logger.info("ОБУЧЕНИЕ МОДЕЛИ 'ШВЕДСКИЙ СТОЛ' (многогоризонт, h=1..5)")
     logger.info("=" * 60)
 
-    buffet_models: dict[int, CatBoostRegressor] = {}
+    global_buffet_models: dict[int, CatBoostRegressor] = {}
+    school_buffet_models_all: dict[str, dict[int, CatBoostRegressor]] = {}
+
     buffet_df = df[df["meal_plan"] == "canteen"].copy()
     if buffet_df.empty:
         logger.warning("Нет canteen-данных — буфетные модели не обучены")
-        return buffet_models
+        return global_buffet_models, school_buffet_models_all
 
     for h in HORIZONS:
         target_cols = [f"target_hot_h{h}", f"target_salad_h{h}", f"target_bakery_h{h}"]
@@ -666,13 +667,36 @@ def train_buffet_models(df: pd.DataFrame) -> dict[int, CatBoostRegressor]:
         model.fit(train_pool, use_best_model=True)
 
         logger.info(
-            f"Буфетная модель h={h}: best_iteration={model.best_iteration_}"
+            f"Буфетная глобальная модель h={h}: best_iteration={model.best_iteration_}"
         )
         model.save_model(str(BUFFET_MODEL_PATHS[h]))
-        logger.info(f"Буфетная модель h={h}: {BUFFET_MODEL_PATHS[h]}")
-        buffet_models[h] = model
+        logger.info(f"Буфетная глобальная модель h={h}: {BUFFET_MODEL_PATHS[h]}")
+        global_buffet_models[h] = model
 
-    return buffet_models
+        # 2. Дообучение для ВСЕХ canteen-школ с достаточным количеством данных
+        all_school_ids = X["school_id"].unique().tolist()
+        logger.info(f"Canteen-школы для дообучения h={h}: {all_school_ids}")
+
+        school_models_h: dict[int, CatBoostRegressor] = {}
+        for school_id in all_school_ids:
+            mask = X["school_id"] == school_id
+            model = _fit_school_model(
+                school_id, X[mask], y[mask], model, h, model_type="buffet"
+            )
+            if model is not None:
+                school_models_h[school_id] = model
+
+        # Сохранение буфетных школьных моделей
+        for school_id, model in school_models_h.items():
+            model_path = MODELS_DIR / f"{school_id}_buffet_model_{MODEL_VERSION}_h{h}.cbm"
+            model.save_model(str(model_path))
+            logger.info(f"Буфетная модель для {school_id} h={h}: {model_path}")
+
+        # Аккумулируем школьные модели
+        for school_id, model in school_models_h.items():
+            school_buffet_models_all.setdefault(school_id, {})[h] = model
+
+    return global_buffet_models, school_buffet_models_all
 
 
 def main() -> None:
@@ -684,8 +708,8 @@ def main() -> None:
     # 1. Стандартное питание (многогоризонт)
     global_models, school_models_all = train_standard_models(df)
 
-    # 2. Шведский стол (многогоризонт)
-    buffet_models = train_buffet_models(df)
+    # 2. Шведский стол (многогоризонт, с дообучением по школам)
+    global_buffet_models, school_buffet_models_all = train_buffet_models(df)
 
     logger.info("=" * 60)
     logger.info("ОБУЧЕНИЕ ЗАВЕРШЕНО УСПЕШНО")
